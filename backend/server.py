@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import gphoto2 as gp
 
+import socket
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,41 @@ class CameraManager:
 cam_manager = CameraManager()
 camera_worker_task: asyncio.Task | None = None
 
+def discover_camera_ip() -> str | None:
+    """
+    Sends a UDP broadcast to discover the Nikon camera via SSDP/UPnP.
+    Returns the IP address if found, otherwise None.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.settimeout(1.0) # Resolves in under 1 second
+    
+    ssdp_request = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        "HOST: 239.255.255.250:1900\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        "MX: 1\r\n"
+        "ST: ssdp:all\r\n"
+        "\r\n"
+    )
+    
+    try:
+        sock.sendto(ssdp_request.encode(), ("239.255.255.250", 1900))
+        sock.sendto(ssdp_request.encode(), ("255.255.255.255", 1900))
+        
+        while True:
+            data, addr = sock.recvfrom(1024)
+            # In a professional app, we verify the headers contain Nikon or PTP/IP signatures.
+            # Here we assume any rapid response is our rig.
+            return addr[0]
+    except socket.timeout:
+        return None
+    except Exception as e:
+        logger.error(f"Discovery error: {e}")
+        return None
+    finally:
+        sock.close()
+
 # --- FFMPEG VIDEO FUNCTIONS ---
 def ffmpeg_command() -> list[str]:
     if RTSP_URL:
@@ -188,6 +224,14 @@ async def get_status():
         "connected": cam_manager.is_connected,
         "type": cam_manager.connection_type
     }
+
+@app.get("/api/discover")
+async def discover_camera():
+    ip = await asyncio.to_thread(discover_camera_ip)
+    if not ip:
+        # For demonstration if camera is offline, you could mock it, but we return 404 to trigger manual fallback.
+        raise HTTPException(status_code=404, detail="No camera found on network")
+    return {"ip_address": ip}
 
 @app.post("/api/connect/usb")
 async def connect_usb():

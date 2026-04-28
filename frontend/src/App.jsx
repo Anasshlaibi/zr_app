@@ -10,6 +10,7 @@ export default function App() {
   const [setupMode, setSetupMode] = useState("wifi"); // 'usb' or 'wifi'
   const [ipAddress, setIpAddress] = useState("192.168.1.50");
   const [isConnecting, setIsConnecting] = useState(false);
+  const [isScanning, setIsScanning] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
 
   const getBaseUrl = () => `http://${window.location.hostname}:8000`;
@@ -46,6 +47,39 @@ export default function App() {
       setIsConnecting(false);
     }
   };
+
+  const discoverCamera = async () => {
+    setIsScanning(true);
+    setErrorMsg("");
+    try {
+      const res = await fetch(`${getBaseUrl()}/api/discover`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Discovery failed");
+      
+      setIpAddress(data.ip_address);
+      
+      // Auto-connect
+      const connectRes = await fetch(`${getBaseUrl()}/api/connect/wifi`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ip_address: data.ip_address })
+      });
+      const connectData = await connectRes.json();
+      if (!connectRes.ok) throw new Error(connectData.detail || "Connection failed");
+      
+      setCamConnected(true);
+    } catch (err) {
+      setErrorMsg(err.message);
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  useEffect(() => {
+    if (setupMode === "wifi" && !camConnected) {
+      discoverCamera();
+    }
+  }, [setupMode, camConnected]);
 
   const sendCommand = async (endpoint, payload = {}) => {
     if (!camConnected) return;
@@ -138,24 +172,30 @@ export default function App() {
             {setupMode === "wifi" && (
               <div className="mb-6">
                 <label className="mb-2 block text-xs font-medium tracking-wide text-zinc-400">CAMERA IP ADDRESS</label>
-                <input 
-                  type="text" 
-                  value={ipAddress}
-                  onChange={(e) => setIpAddress(e.target.value)}
-                  className="w-full rounded-lg border border-zinc-700 bg-black px-4 py-3 text-sm text-white focus:border-emerald-500 focus:outline-none"
-                  placeholder="192.168.1.x"
-                />
+                {isScanning ? (
+                  <div className="w-full rounded-lg border border-emerald-900 bg-emerald-900/20 px-4 py-3 text-sm font-medium tracking-wide text-emerald-400 flex items-center justify-center animate-pulse">
+                    Scanning Network...
+                  </div>
+                ) : (
+                  <input 
+                    type="text" 
+                    value={ipAddress}
+                    onChange={(e) => setIpAddress(e.target.value)}
+                    className="w-full rounded-lg border border-zinc-700 bg-black px-4 py-3 text-sm text-white focus:border-emerald-500 focus:outline-none"
+                    placeholder="192.168.1.x"
+                  />
+                )}
               </div>
             )}
 
             {errorMsg && <div className="mb-4 rounded border border-red-900/50 bg-red-900/20 p-3 text-xs text-red-400">{errorMsg}</div>}
 
             <button 
-              onClick={handleConnect}
-              disabled={isConnecting}
+              onClick={setupMode === "wifi" && !isScanning ? discoverCamera : handleConnect}
+              disabled={isConnecting || isScanning}
               className="w-full rounded-lg bg-emerald-600 py-3 text-sm font-bold tracking-wide text-white transition hover:bg-emerald-500 disabled:opacity-50"
             >
-              {isConnecting ? "CONNECTING..." : "INITIALIZE RIG"}
+              {isConnecting ? "CONNECTING..." : isScanning ? "SCANNING..." : setupMode === "wifi" ? "RESCAN & INITIALIZE" : "INITIALIZE RIG"}
             </button>
           </div>
         </div>
