@@ -4,12 +4,11 @@ import subprocess
 from typing import Set
 import logging
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import gphoto2 as gp
 
-# Set up logging for our camera commands
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -32,15 +31,14 @@ RTSP_URL = os.getenv("NIKON_RTSP_URL", "").strip()
 TARGET_SIZE = os.getenv("STREAM_SIZE", "1280x720")
 TARGET_FPS = os.getenv("STREAM_FPS", "30")
 
-# --- CAMERA CONTROL (PHASE 2 SINGLETON) ---
+# --- CAMERA CONTROL & CONNECTION MANAGER ---
 class CameraCommand(BaseModel):
     value: str | None = None
 
+class ConnectionRequest(BaseModel):
+    ip_address: str | None = None
+
 class CameraManager:
-    """
-    Singleton Manager to ensure only ONE active PTP/IP connection 
-    exists on port 15740 at a time, preventing camera lockups.
-    """
     _instance = None
 
     def __new__(cls):
@@ -50,50 +48,68 @@ class CameraManager:
             cls._instance.context = gp.Context()
             cls._instance.queue = asyncio.Queue()
             cls._instance.is_connected = False
+            cls._instance.connection_type = None
         return cls._instance
 
-    def _connect(self):
-        if not self.is_connected:
-            try:
-                self.camera.init(self.context)
-                self.is_connected = True
-                logger.info("✅ PTP/IP Camera successfully connected.")
-            except gp.GPhoto2Error as e:
-                logger.error(f"⚠️ Camera connection failed (is it on the network?): {e}")
+    def connect_usb(self):
+        try:
+            # Re-initialize to clear old states
+            self.camera = gp.Camera()
+            self.camera.init(self.context)
+            self.is_connected = True
+            self.connection_type = "USB-C"
+            logger.info("✅ Connected to Nikon via USB-C")
+            return True
+        except gp.GPhoto2Error as e:
+            logger.error(f"⚠️ USB Connection failed: {e}")
+            self.is_connected = False
+            raise Exception("Could not detect camera on USB. Is it plugged in and powered on?")
+
+    def connect_wifi(self, ip_address: str):
+        try:
+            self.camera = gp.Camera()
+            port_info_list = gp.PortInfoList()
+            port_info_list.load()
+            
+            # Find the specific PTP/IP port index
+            idx = port_info_list.lookup_path(f"ptpip:{ip_address}")
+            if idx < 0:
+                raise Exception(f"PTP/IP port not found for {ip_address}")
+                
+            self.camera.set_port_info(port_info_list[idx])
+            self.camera.init(self.context)
+            self.is_connected = True
+            self.connection_type = "Wi-Fi"
+            logger.info(f"✅ Connected to Nikon via Wi-Fi ({ip_address})")
+            return True
+        except gp.GPhoto2Error as e:
+            logger.error(f"⚠️ Wi-Fi Connection failed: {e}")
+            self.is_connected = False
+            raise Exception("Could not connect over Wi-Fi. Check IP address and network.")
 
     async def worker_loop(self):
-        """Background loop that processes commands one by one safely."""
         logger.info("Starting Camera Command Worker...")
-        # Attempt initial connection
-        await asyncio.to_thread(self._connect)
-
         while True:
             cmd_type, payload = await self.queue.get()
-            
             try:
-                if not self.is_connected:
-                    await asyncio.to_thread(self._connect)
-
                 if self.is_connected:
                     logger.info(f"Executing Command: {cmd_type} -> {payload}")
-                    
-                    # NOTE: Here is where the actual gphoto2 config setting happens.
-                    # We wrap it in to_thread because gphoto2 calls are synchronous and block.
                     if cmd_type == "record":
-                        # e.g., self.camera.trigger_capture(self.context)
-                        pass
+                        logger.info("📸 Triggering capture...")
+                        await asyncio.to_thread(self.camera.trigger_capture, self.context)
                     elif cmd_type in ["iso", "shutterspeed", "aperture"]:
-                        # config = self.camera.get_config(self.context)
-                        # child = config.get_child_by_name(cmd_type)
-                        # child.set_value(payload)
-                        # self.camera.set_config(config, self.context)
-                        pass
+                        logger.info(f"⚙️ Setting {cmd_type} to {payload}...")
+                        def update_config():
+                            config = self.camera.get_config(self.context)
+                            child = config.get_child_by_name(cmd_type)
+                            child.set_value(payload)
+                            self.camera.set_config(config, self.context)
+                        await asyncio.to_thread(update_config)
                 else:
                     logger.warning(f"Skipped {cmd_type}: Camera not connected.")
-
             except Exception as e:
                 logger.error(f"Error executing {cmd_type}: {e}")
-                self.is_connected = False # Force reconnect next time
+                self.is_connected = False # Drop connection on fatal command error
             finally:
                 self.queue.task_done()
 
@@ -150,10 +166,8 @@ async def startup_event() -> None:
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
     global stream_task, ffmpeg_process, camera_worker_task
-    if stream_task:
-        stream_task.cancel()
-    if camera_worker_task:
-        camera_worker_task.cancel()
+    if stream_task: stream_task.cancel()
+    if camera_worker_task: camera_worker_task.cancel()
     if ffmpeg_process is not None and ffmpeg_process.poll() is None:
         ffmpeg_process.terminate()
         ffmpeg_process.wait(timeout=2)
@@ -163,28 +177,53 @@ async def websocket_video(ws: WebSocket) -> None:
     await ws.accept()
     clients.add(ws)
     try:
-        while True:
-            await ws.receive()
+        while True: await ws.receive()
     except Exception:
         clients.discard(ws)
 
-# --- PHASE 2 CONTROL ENDPOINTS ---
+# --- CONNECTION ENDPOINTS ---
+@app.get("/api/status")
+async def get_status():
+    return {
+        "connected": cam_manager.is_connected,
+        "type": cam_manager.connection_type
+    }
+
+@app.post("/api/connect/usb")
+async def connect_usb():
+    try:
+        await asyncio.to_thread(cam_manager.connect_usb)
+        return {"status": "connected", "type": "usb"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/connect/wifi")
+async def connect_wifi(req: ConnectionRequest):
+    if not req.ip_address:
+        raise HTTPException(status_code=400, detail="IP address required for Wi-Fi")
+    try:
+        await asyncio.to_thread(cam_manager.connect_wifi, req.ip_address)
+        return {"status": "connected", "type": "wifi"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- CAMERA CONTROL ENDPOINTS ---
 @app.post("/api/camera/iso")
 async def set_iso(req: CameraCommand):
     await cam_manager.queue.put(("iso", req.value))
-    return {"status": "queued", "command": "iso", "value": req.value}
+    return {"status": "queued"}
 
 @app.post("/api/camera/shutter")
 async def set_shutter(req: CameraCommand):
     await cam_manager.queue.put(("shutterspeed", req.value))
-    return {"status": "queued", "command": "shutterspeed", "value": req.value}
+    return {"status": "queued"}
 
 @app.post("/api/camera/aperture")
 async def set_aperture(req: CameraCommand):
     await cam_manager.queue.put(("aperture", req.value))
-    return {"status": "queued", "command": "aperture", "value": req.value}
+    return {"status": "queued"}
 
 @app.post("/api/camera/record")
 async def toggle_record(req: CameraCommand):
     await cam_manager.queue.put(("record", req.value))
-    return {"status": "queued", "command": "record", "value": req.value}
+    return {"status": "queued"}

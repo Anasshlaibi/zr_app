@@ -2,29 +2,65 @@ import { useEffect, useRef, useState } from "react";
 
 export default function App() {
   const canvasRef = useRef(null);
-  const [status, setStatus] = useState("CONNECTING");
+  const [streamStatus, setStreamStatus] = useState("CONNECTING");
   const [rec, setRec] = useState(false);
+  
+  // Connection Setup States
+  const [camConnected, setCamConnected] = useState(false);
+  const [setupMode, setSetupMode] = useState("wifi"); // 'usb' or 'wifi'
+  const [ipAddress, setIpAddress] = useState("192.168.1.50");
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [errorMsg, setErrorMsg] = useState("");
 
-  // Helper function to hit the FastAPI backend
-  const sendCommand = async (endpoint, payload = {}) => {
+  const getBaseUrl = () => `http://${window.location.hostname}:8000`;
+
+  // Check if backend already has a connection
+  useEffect(() => {
+    fetch(`${getBaseUrl()}/api/status`)
+      .then(res => res.json())
+      .then(data => {
+        if (data.connected) setCamConnected(true);
+      })
+      .catch(() => console.log("Backend offline"));
+  }, []);
+
+  const handleConnect = async () => {
+    setIsConnecting(true);
+    setErrorMsg("");
+    const endpoint = setupMode === "usb" ? "/api/connect/usb" : "/api/connect/wifi";
+    const body = setupMode === "wifi" ? { ip_address: ipAddress } : {};
+
     try {
-      const url = `http://${window.location.hostname}:8000/api/camera/${endpoint}`;
-      await fetch(url, {
+      const res = await fetch(`${getBaseUrl()}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      
+      if (!res.ok) throw new Error(data.detail || "Connection failed");
+      setCamConnected(true);
+    } catch (err) {
+      setErrorMsg(err.message);
+    } finally {
+      setIsConnecting(false);
+    }
+  };
+
+  const sendCommand = async (endpoint, payload = {}) => {
+    if (!camConnected) return;
+    try {
+      await fetch(`${getBaseUrl()}/api/camera/${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
     } catch (err) {
-      console.error(`Failed to send ${endpoint} command`, err);
+      console.error(`Failed to send ${endpoint}`, err);
     }
   };
 
-  const handleRecordToggle = () => {
-    const newRecState = !rec;
-    setRec(newRecState);
-    sendCommand("record", { value: newRecState ? "start" : "stop" });
-  };
-
+  // Video Stream Setup
   useEffect(() => {
     let isMounted = true;
     let player = null;
@@ -38,18 +74,16 @@ export default function App() {
 
       if (!isMounted || !JSMpeg || !canvas) return;
 
-      setStatus("CONNECTING");
+      setStreamStatus("CONNECTING");
       player = new JSMpeg.Player(wsUrl, {
         canvas,
         autoplay: true,
         audio: false,
-        disableGl: false,
-        preserveDrawingBuffer: true,
-        onSourceEstablished: () => isMounted && setStatus("LIVE"),
-        onStalled: () => isMounted && setStatus("RECONNECTING"),
+        onSourceEstablished: () => isMounted && setStreamStatus("LIVE"),
+        onStalled: () => isMounted && setStreamStatus("RECONNECTING"),
         onSourceCompleted: () => {
           if (!isMounted) return;
-          setStatus("RECONNECTING");
+          setStreamStatus("RECONNECTING");
           retryTimer = setTimeout(connectPlayer, 800);
         },
       });
@@ -64,7 +98,7 @@ export default function App() {
       script.src = "https://cdn.jsdelivr.net/npm/jsmpeg@0.2.1/jsmpeg.min.js";
       script.async = true;
       script.onload = () => isMounted && connectPlayer();
-      script.onerror = () => isMounted && setStatus("ERROR");
+      script.onerror = () => isMounted && setStreamStatus("ERROR");
       document.body.appendChild(script);
     };
 
@@ -78,61 +112,84 @@ export default function App() {
   }, []);
 
   return (
-    <main className="h-screen w-screen overflow-hidden bg-zinc-950 text-zinc-100">
-      <section className="mx-auto flex h-full w-full max-w-[1024px] flex-col justify-between p-2">
+    <main className="relative h-screen w-screen overflow-hidden bg-zinc-950 text-zinc-100 font-sans">
+      
+      {/* CONNECTION SETUP MODAL */}
+      {!camConnected && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-sm p-4">
+          <div className="w-full max-w-sm rounded-xl border border-zinc-800 bg-zinc-900 p-6 shadow-2xl">
+            <h2 className="mb-6 text-center text-lg font-bold tracking-[0.15em] text-zinc-100">RIG CONNECTION</h2>
+            
+            <div className="mb-6 flex rounded-lg bg-zinc-950 p-1">
+              <button 
+                onClick={() => setSetupMode("wifi")}
+                className={`flex-1 rounded-md py-2 text-sm font-medium transition ${setupMode === "wifi" ? "bg-zinc-800 text-white" : "text-zinc-500"}`}
+              >
+                Wi-Fi (PTP/IP)
+              </button>
+              <button 
+                onClick={() => setSetupMode("usb")}
+                className={`flex-1 rounded-md py-2 text-sm font-medium transition ${setupMode === "usb" ? "bg-zinc-800 text-white" : "text-zinc-500"}`}
+              >
+                USB-C
+              </button>
+            </div>
+
+            {setupMode === "wifi" && (
+              <div className="mb-6">
+                <label className="mb-2 block text-xs font-medium tracking-wide text-zinc-400">CAMERA IP ADDRESS</label>
+                <input 
+                  type="text" 
+                  value={ipAddress}
+                  onChange={(e) => setIpAddress(e.target.value)}
+                  className="w-full rounded-lg border border-zinc-700 bg-black px-4 py-3 text-sm text-white focus:border-emerald-500 focus:outline-none"
+                  placeholder="192.168.1.x"
+                />
+              </div>
+            )}
+
+            {errorMsg && <div className="mb-4 rounded border border-red-900/50 bg-red-900/20 p-3 text-xs text-red-400">{errorMsg}</div>}
+
+            <button 
+              onClick={handleConnect}
+              disabled={isConnecting}
+              className="w-full rounded-lg bg-emerald-600 py-3 text-sm font-bold tracking-wide text-white transition hover:bg-emerald-500 disabled:opacity-50"
+            >
+              {isConnecting ? "CONNECTING..." : "INITIALIZE RIG"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* MAIN MONITOR UI */}
+      <section className="mx-auto flex h-full w-full max-w-[1024px] flex-col justify-between p-2 transition-opacity duration-500" style={{ opacity: camConnected ? 1 : 0.2 }}>
         <header className="flex items-center justify-between rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2">
           <div className="text-xs tracking-[0.18em] text-zinc-500">ZINECONTROL WEB</div>
           <div className="flex items-center gap-2">
-            <span
-              className={`h-2.5 w-2.5 rounded-full ${
-                status === "LIVE"
-                  ? "bg-emerald-500"
-                  : status === "CONNECTING" || status === "RECONNECTING"
-                    ? "bg-amber-500"
-                    : "bg-red-600"
-              }`}
-            />
-            <span className="text-[11px] font-medium tracking-wide text-zinc-300">{status}</span>
+            <span className={`h-2.5 w-2.5 rounded-full ${streamStatus === "LIVE" ? "bg-emerald-500" : "bg-red-600"}`} />
+            <span className="text-[11px] font-medium tracking-wide text-zinc-300">FEED: {streamStatus}</span>
           </div>
         </header>
 
         <div className="my-2 flex min-h-0 flex-1 items-center justify-center">
-          <div className="relative w-full overflow-hidden rounded-lg border border-zinc-800 bg-black shadow-[0_20px_60px_rgba(0,0,0,0.5)]">
+          <div className="relative w-full overflow-hidden rounded-lg border border-zinc-800 bg-black">
             <div className="aspect-video w-full">
               <canvas ref={canvasRef} width={1280} height={720} className="h-full w-full object-cover" />
-            </div>
-            <div className="pointer-events-none absolute left-3 top-3 rounded border border-zinc-700 bg-zinc-950/70 px-2 py-1 text-[10px] font-medium tracking-[0.14em] text-zinc-300">
-              ZR LIVE MONITOR
             </div>
           </div>
         </div>
 
         <footer className="grid grid-cols-4 gap-2 rounded-lg border border-zinc-800 bg-zinc-900 p-2">
-          <button 
-            onClick={() => sendCommand("iso", { value: "800" })}
-            className="rounded-md border border-zinc-700 bg-zinc-800 px-2 py-3 text-sm font-semibold text-zinc-200 active:scale-[0.98] active:bg-zinc-700 transition"
-          >
-            ISO (800)
-          </button>
-          <button 
-            onClick={() => sendCommand("shutter", { value: "1/50" })}
-            className="rounded-md border border-zinc-700 bg-zinc-800 px-2 py-3 text-sm font-semibold text-zinc-200 active:scale-[0.98] active:bg-zinc-700 transition"
-          >
-            Shutter
-          </button>
-          <button 
-            onClick={() => sendCommand("aperture", { value: "2.8" })}
-            className="rounded-md border border-zinc-700 bg-zinc-800 px-2 py-3 text-sm font-semibold text-zinc-200 active:scale-[0.98] active:bg-zinc-700 transition"
-          >
-            Aperture
-          </button>
+          <button onClick={() => sendCommand("iso", { value: "800" })} className="rounded-md border border-zinc-700 bg-zinc-800 py-3 text-sm font-semibold text-zinc-200 active:bg-zinc-700">ISO</button>
+          <button onClick={() => sendCommand("shutter", { value: "1/50" })} className="rounded-md border border-zinc-700 bg-zinc-800 py-3 text-sm font-semibold text-zinc-200 active:bg-zinc-700">Shutter</button>
+          <button onClick={() => sendCommand("aperture", { value: "2.8" })} className="rounded-md border border-zinc-700 bg-zinc-800 py-3 text-sm font-semibold text-zinc-200 active:bg-zinc-700">Iris</button>
           <button
-            onClick={handleRecordToggle}
-            className={`rounded-md px-2 py-3 text-sm font-extrabold tracking-wide text-white transition active:scale-[0.98] ${
-              rec
-                ? "border border-red-300 bg-red-600 shadow-[0_0_18px_rgba(220,38,38,0.45)]"
-                : "border border-red-900 bg-red-700/90"
-            }`}
+            onClick={() => {
+              const newState = !rec;
+              setRec(newState);
+              sendCommand("record", { value: newState ? "start" : "stop" });
+            }}
+            className={`rounded-md py-3 text-sm font-extrabold text-white transition ${rec ? "bg-red-600" : "bg-red-800/80"}`}
           >
             {rec ? "REC ●" : "REC"}
           </button>
