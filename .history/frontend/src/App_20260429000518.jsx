@@ -5,26 +5,6 @@ export default function App() {
   const [status, setStatus] = useState("CONNECTING");
   const [rec, setRec] = useState(false);
 
-  // Helper function to hit the FastAPI backend
-  const sendCommand = async (endpoint, payload = {}) => {
-    try {
-      const url = `http://${window.location.hostname}:8000/api/camera/${endpoint}`;
-      await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-    } catch (err) {
-      console.error(`Failed to send ${endpoint} command`, err);
-    }
-  };
-
-  const handleRecordToggle = () => {
-    const newRecState = !rec;
-    setRec(newRecState);
-    sendCommand("record", { value: newRecState ? "start" : "stop" });
-  };
-
   useEffect(() => {
     let isMounted = true;
     let player = null;
@@ -36,7 +16,9 @@ export default function App() {
       const JSMpeg = window.JSMpeg;
       const canvas = canvasRef.current;
 
-      if (!isMounted || !JSMpeg || !canvas) return;
+      if (!isMounted || !JSMpeg || !canvas) {
+        return;
+      }
 
       setStatus("CONNECTING");
       player = new JSMpeg.Player(wsUrl, {
@@ -48,7 +30,9 @@ export default function App() {
         onSourceEstablished: () => isMounted && setStatus("LIVE"),
         onStalled: () => isMounted && setStatus("RECONNECTING"),
         onSourceCompleted: () => {
-          if (!isMounted) return;
+          if (!isMounted) {
+            return;
+          }
           setStatus("RECONNECTING");
           retryTimer = setTimeout(connectPlayer, 800);
         },
@@ -60,11 +44,20 @@ export default function App() {
         connectPlayer();
         return;
       }
+
       const script = document.createElement("script");
       script.src = "https://cdn.jsdelivr.net/npm/jsmpeg@0.2.1/jsmpeg.min.js";
       script.async = true;
-      script.onload = () => isMounted && connectPlayer();
-      script.onerror = () => isMounted && setStatus("ERROR");
+      script.onload = () => {
+        if (isMounted) {
+          connectPlayer();
+        }
+      };
+      script.onerror = () => {
+        if (isMounted) {
+          setStatus("ERROR");
+        }
+      };
       document.body.appendChild(script);
     };
 
@@ -72,8 +65,12 @@ export default function App() {
 
     return () => {
       isMounted = false;
-      if (retryTimer) clearTimeout(retryTimer);
-      if (player && typeof player.destroy === "function") player.destroy();
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+      }
+      if (player && typeof player.destroy === "function") {
+        player.destroy();
+      }
     };
   }, []);
 
@@ -108,26 +105,17 @@ export default function App() {
         </div>
 
         <footer className="grid grid-cols-4 gap-2 rounded-lg border border-zinc-800 bg-zinc-900 p-2">
-          <button 
-            onClick={() => sendCommand("iso", { value: "800" })}
-            className="rounded-md border border-zinc-700 bg-zinc-800 px-2 py-3 text-sm font-semibold text-zinc-200 active:scale-[0.98] active:bg-zinc-700 transition"
-          >
-            ISO (800)
+          <button className="rounded-md border border-zinc-700 bg-zinc-800 px-2 py-3 text-sm font-semibold text-zinc-200 active:scale-[0.98]">
+            ISO
           </button>
-          <button 
-            onClick={() => sendCommand("shutter", { value: "1/50" })}
-            className="rounded-md border border-zinc-700 bg-zinc-800 px-2 py-3 text-sm font-semibold text-zinc-200 active:scale-[0.98] active:bg-zinc-700 transition"
-          >
+          <button className="rounded-md border border-zinc-700 bg-zinc-800 px-2 py-3 text-sm font-semibold text-zinc-200 active:scale-[0.98]">
             Shutter
           </button>
-          <button 
-            onClick={() => sendCommand("aperture", { value: "2.8" })}
-            className="rounded-md border border-zinc-700 bg-zinc-800 px-2 py-3 text-sm font-semibold text-zinc-200 active:scale-[0.98] active:bg-zinc-700 transition"
-          >
+          <button className="rounded-md border border-zinc-700 bg-zinc-800 px-2 py-3 text-sm font-semibold text-zinc-200 active:scale-[0.98]">
             Aperture
           </button>
           <button
-            onClick={handleRecordToggle}
+            onClick={() => setRec((value) => !value)}
             className={`rounded-md px-2 py-3 text-sm font-extrabold tracking-wide text-white transition active:scale-[0.98] ${
               rec
                 ? "border border-red-300 bg-red-600 shadow-[0_0_18px_rgba(220,38,38,0.45)]"
