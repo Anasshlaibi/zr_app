@@ -2,4 +2,3 @@ fastapi
 uvicorn[standard]
 websockets
 gphoto2
-pyudev; sys_platform == "linux"
