@@ -1,7 +1,7 @@
 import asyncio
 import os
 import subprocess
-from typing import Set
+from typing import Set, Dict
 import logging
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -15,6 +15,7 @@ collections.Mapping = collections.abc.Mapping
 collections.MutableSequence = collections.abc.MutableSequence
 
 import ptpy
+from ptpy import constants
 
 import socket
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +47,34 @@ class CameraCommand(BaseModel):
 class ConnectionRequest(BaseModel):
     ip_address: str | None = None
 
+# --- PTP PROPERTY MAPPINGS FOR NIKON ---
+ISO_MAPPING = {
+    "100": 0x0064,
+    "200": 0x00C8,
+    "400": 0x0190,
+    "800": 0x0320,
+    "1600": 0x0640,
+    "3200": 0x0C80,
+    "6400": 0x1900,
+    "auto": 0x0000,
+}
+
+SHUTTER_MAPPING = {
+    "1/50": 0x0032,
+    "1/100": 0x0064,
+    "1/200": 0x00C8,
+    "1/500": 0x01F4,
+    "1/1000": 0x03E8,
+}
+
+APERTURE_MAPPING = {
+    "1.4": 0x8E,
+    "2.0": 0xC6,
+    "2.8": 0xFE,
+    "4.0": 0x136,
+    "5.6": 0x16E,
+}
+
 class CameraManager:
     _instance = None
 
@@ -56,6 +85,12 @@ class CameraManager:
             cls._instance.queue = asyncio.Queue()
             cls._instance.is_connected = False
             cls._instance.connection_type = None
+            cls._instance.state = {
+                "iso": "auto",
+                "shutter": "1/50",
+                "aperture": "2.8",
+                "recording": False
+            }
         return cls._instance
 
     def connect_usb(self):
@@ -83,6 +118,81 @@ class CameraManager:
             self.is_connected = False
             raise Exception("Could not connect over Wi-Fi. Check IP address and network.")
 
+    def set_iso(self, iso_value: str):
+        """Set camera ISO via PTP protocol"""
+        try:
+            if iso_value not in ISO_MAPPING:
+                logger.warning(f"Unknown ISO value: {iso_value}")
+                return False
+            
+            ptp_value = ISO_MAPPING[iso_value]
+            # Property code for ISO on Nikon (0x500e is common)
+            self.camera.set_property(0x500E, ptp_value)
+            self.state["iso"] = iso_value
+            logger.info(f"✅ ISO set to {iso_value}")
+            return True
+        except Exception as e:
+            logger.error(f"Error setting ISO: {e}")
+            return False
+
+    def set_shutter(self, shutter_value: str):
+        """Set camera shutter speed via PTP protocol"""
+        try:
+            if shutter_value not in SHUTTER_MAPPING:
+                logger.warning(f"Unknown shutter value: {shutter_value}")
+                return False
+            
+            ptp_value = SHUTTER_MAPPING[shutter_value]
+            # Property code for shutter speed on Nikon (0x500d is common)
+            self.camera.set_property(0x500D, ptp_value)
+            self.state["shutter"] = shutter_value
+            logger.info(f"✅ Shutter speed set to {shutter_value}")
+            return True
+        except Exception as e:
+            logger.error(f"Error setting shutter: {e}")
+            return False
+
+    def set_aperture(self, aperture_value: str):
+        """Set camera aperture via PTP protocol"""
+        try:
+            if aperture_value not in APERTURE_MAPPING:
+                logger.warning(f"Unknown aperture value: {aperture_value}")
+                return False
+            
+            ptp_value = APERTURE_MAPPING[aperture_value]
+            # Property code for aperture on Nikon (0x500c is common)
+            self.camera.set_property(0x500C, ptp_value)
+            self.state["aperture"] = aperture_value
+            logger.info(f"✅ Aperture set to f/{aperture_value}")
+            return True
+        except Exception as e:
+            logger.error(f"Error setting aperture: {e}")
+            return False
+
+    def start_recording(self):
+        """Start video recording"""
+        try:
+            # Send record operation code
+            self.camera.send_request(0x990B)  # Nikon record start operation
+            self.state["recording"] = True
+            logger.info("📹 Recording started")
+            return True
+        except Exception as e:
+            logger.error(f"Error starting recording: {e}")
+            return False
+
+    def stop_recording(self):
+        """Stop video recording"""
+        try:
+            # Send stop recording operation code
+            self.camera.send_request(0x990C)  # Nikon record stop operation
+            self.state["recording"] = False
+            logger.info("⏹️ Recording stopped")
+            return True
+        except Exception as e:
+            logger.error(f"Error stopping recording: {e}")
+            return False
+
     async def worker_loop(self):
         logger.info("Starting Camera Command Worker...")
         while True:
@@ -91,17 +201,20 @@ class CameraManager:
                 if self.is_connected and self.camera:
                     logger.info(f"Executing Command: {cmd_type} -> {payload}")
                     if cmd_type == "record":
-                        logger.info("📸 Triggering capture...")
-                        await asyncio.to_thread(self.camera.initiate_capture)
-                    elif cmd_type in ["iso", "shutterspeed", "aperture"]:
-                        logger.info(f"⚙️ Setting {cmd_type} to {payload}...")
-                        # Placeholder for property setting using ptpy
-                        pass
+                        if payload == "start":
+                            await asyncio.to_thread(self.start_recording)
+                        elif payload == "stop":
+                            await asyncio.to_thread(self.stop_recording)
+                    elif cmd_type == "iso":
+                        await asyncio.to_thread(self.set_iso, payload)
+                    elif cmd_type == "shutterspeed":
+                        await asyncio.to_thread(self.set_shutter, payload)
+                    elif cmd_type == "aperture":
+                        await asyncio.to_thread(self.set_aperture, payload)
                 else:
                     logger.warning(f"Skipped {cmd_type}: Camera not connected.")
             except Exception as e:
                 logger.error(f"Error executing {cmd_type}: {e}")
-                self.is_connected = False # Drop connection on fatal command error
             finally:
                 self.queue.task_done()
 
@@ -115,7 +228,7 @@ def discover_camera_ip() -> str | None:
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.settimeout(1.0) # Resolves in under 1 second
+    sock.settimeout(1.0)
     
     ssdp_request = (
         "M-SEARCH * HTTP/1.1\r\n"
@@ -132,8 +245,6 @@ def discover_camera_ip() -> str | None:
         
         while True:
             data, addr = sock.recvfrom(1024)
-            # In a professional app, we verify the headers contain Nikon or PTP/IP signatures.
-            # Here we assume any rapid response is our rig.
             return addr[0]
     except socket.timeout:
         return None
@@ -213,14 +324,14 @@ async def websocket_video(ws: WebSocket) -> None:
 async def get_status():
     return {
         "connected": cam_manager.is_connected,
-        "type": cam_manager.connection_type
+        "type": cam_manager.connection_type,
+        "state": cam_manager.state
     }
 
 @app.get("/api/discover")
 async def discover_camera():
     ip = await asyncio.to_thread(discover_camera_ip)
     if not ip:
-        # For demonstration if camera is offline, you could mock it, but we return 404 to trigger manual fallback.
         raise HTTPException(status_code=404, detail="No camera found on network")
     return {"ip_address": ip}
 
