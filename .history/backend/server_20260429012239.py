@@ -35,7 +35,7 @@ clients: Set[WebSocket] = set()
 stream_task: asyncio.Task | None = None
 ffmpeg_process: subprocess.Popen[bytes] | None = None
 
-RTSP_URL = os.getenv("NIKON_RTSP_URL", "rtsp://127.0.0.1:8554/live").strip()
+RTSP_URL = os.getenv("NIKON_RTSP_URL", "").strip()
 TARGET_SIZE = os.getenv("STREAM_SIZE", "1280x720")
 TARGET_FPS = os.getenv("STREAM_FPS", "30")
 
@@ -242,6 +242,7 @@ async def connect_wifi(req: ConnectionRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+# --- CAMERA CONTROL ENDPOINTS ---
 @app.post("/api/camera/iso")
 async def set_iso(req: CameraCommand):
     await cam_manager.queue.put(("iso", req.value))
@@ -261,8 +262,3 @@ async def set_aperture(req: CameraCommand):
 async def toggle_record(req: CameraCommand):
     await cam_manager.queue.put(("record", req.value))
     return {"status": "queued"}
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
